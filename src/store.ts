@@ -546,6 +546,14 @@ function initializeDatabase(db: Database): void {
     )
   `);
 
+  // Settings table for persistent configuration
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `);
+
   // Content vectors
   const cvInfo = db.prepare(`PRAGMA table_info(content_vectors)`).all() as { name: string }[];
   const hasSeqColumn = cvInfo.some(col => col.name === 'seq');
@@ -560,7 +568,7 @@ function initializeDatabase(db: Database): void {
       pos INTEGER NOT NULL DEFAULT 0,
       model TEXT NOT NULL,
       embedded_at TEXT NOT NULL,
-      PRIMARY KEY (hash, seq)
+      PRIMARY KEY (hash, seq, model)
     )
   `);
 
@@ -612,8 +620,9 @@ function initializeDatabase(db: Database): void {
 }
 
 
-function ensureVecTableInternal(db: Database, dimensions: number): void {
-  const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
+function ensureVecTableInternal(db: Database, dimensions: number, modelKey?: string): void {
+  const tableName = modelKey ? `vectors_vec_${sanitizeModelKey(modelKey)}` : 'vectors_vec';
+  const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`).get(tableName) as { sql: string } | null;
   if (tableInfo) {
     const match = tableInfo.sql.match(/float\[(\d+)\]/);
     const hasHashSeq = tableInfo.sql.includes('hash_seq');
@@ -621,9 +630,9 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
     if (existingDims === dimensions && hasHashSeq && hasCosine) return;
     // Table exists but wrong schema - need to rebuild
-    db.exec("DROP TABLE IF EXISTS vectors_vec");
+    db.exec(`DROP TABLE IF EXISTS ${tableName}`);
   }
-  db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
+  db.exec(`CREATE VIRTUAL TABLE ${tableName} USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
 }
 
 // =============================================================================
@@ -634,10 +643,10 @@ export type Store = {
   db: Database;
   dbPath: string;
   close: () => void;
-  ensureVecTable: (dimensions: number) => void;
+  ensureVecTable: (dimensions: number, modelKey?: string) => void;
 
   // Index health
-  getHashesNeedingEmbedding: () => number;
+  getHashesNeedingEmbedding: (modelName?: string) => number;
   getIndexHealth: () => IndexHealthInfo;
   getStatus: () => IndexStatus;
 
@@ -696,9 +705,14 @@ export type Store = {
   getActiveDocumentPaths: (collectionName: string) => string[];
 
   // Vector/embedding operations
-  getHashesForEmbedding: () => { hash: string; body: string; path: string }[];
+  getHashesForEmbedding: (modelName?: string) => { hash: string; body: string; path: string }[];
   clearAllEmbeddings: () => void;
+  clearEmbeddingsForModel: (modelName: string) => void;
   insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => void;
+
+  // Model utilities
+  sanitizeModelKey: (modelName: string) => string;
+  getActiveModelName: () => string;
 };
 
 /**
@@ -717,10 +731,10 @@ export function createStore(dbPath?: string): Store {
     db,
     dbPath: resolvedPath,
     close: () => db.close(),
-    ensureVecTable: (dimensions: number) => ensureVecTableInternal(db, dimensions),
+    ensureVecTable: (dimensions: number, modelKey?: string) => ensureVecTableInternal(db, dimensions, modelKey),
 
     // Index health
-    getHashesNeedingEmbedding: () => getHashesNeedingEmbedding(db),
+    getHashesNeedingEmbedding: (modelName?: string) => getHashesNeedingEmbedding(db, modelName),
     getIndexHealth: () => getIndexHealth(db),
     getStatus: () => getStatus(db),
 
@@ -779,9 +793,18 @@ export function createStore(dbPath?: string): Store {
     getActiveDocumentPaths: (collectionName: string) => getActiveDocumentPaths(db, collectionName),
 
     // Vector/embedding operations
-    getHashesForEmbedding: () => getHashesForEmbedding(db),
+    getHashesForEmbedding: (modelName?: string) => getHashesForEmbedding(db, modelName),
     clearAllEmbeddings: () => clearAllEmbeddings(db),
+    clearEmbeddingsForModel: (modelName: string) => clearEmbeddingsForModel(db, modelName),
     insertEmbedding: (hash: string, seq: number, pos: number, embedding: Float32Array, model: string, embeddedAt: string) => insertEmbedding(db, hash, seq, pos, embedding, model, embeddedAt),
+
+    // Model utilities
+    sanitizeModelKey: (modelName: string) => sanitizeModelKey(modelName),
+    getActiveModelName: () => getActiveModelName(db),
+
+    // Settings
+    getSetting: (key: string) => getSetting(db, key),
+    setSetting: (key: string, value: string) => setSetting(db, key, value),
   };
 }
 
@@ -931,13 +954,14 @@ export type IndexStatus = {
 // Index health
 // =============================================================================
 
-export function getHashesNeedingEmbedding(db: Database): number {
+export function getHashesNeedingEmbedding(db: Database, modelName?: string): number {
+  const model = modelName || getActiveModelName(db);
   const result = db.prepare(`
     SELECT COUNT(DISTINCT d.hash) as count
     FROM documents d
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0 AND v.model = ?
     WHERE d.active = 1 AND v.hash IS NULL
-  `).get() as { count: number };
+  `).get(model) as { count: number };
   return result.count;
 }
 
@@ -1028,12 +1052,12 @@ export function cleanupOrphanedContent(db: Database): number {
  * Returns the number of orphaned embedding chunks deleted.
  */
 export function cleanupOrphanedVectors(db: Database): number {
-  // Check if vectors_vec table exists
-  const tableExists = db.prepare(`
-    SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'
-  `).get();
+  // Get all vectors_vec* tables
+  const vecTables = db.prepare(`
+    SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vectors_vec%'
+  `).all() as { name: string }[];
 
-  if (!tableExists) {
+  if (vecTables.length === 0) {
     return 0;
   }
 
@@ -1049,15 +1073,17 @@ export function cleanupOrphanedVectors(db: Database): number {
     return 0;
   }
 
-  // Delete from vectors_vec first
-  db.exec(`
-    DELETE FROM vectors_vec WHERE hash_seq IN (
-      SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
-      WHERE NOT EXISTS (
-        SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+  // Delete from all vectors_vec* tables
+  for (const table of vecTables) {
+    db.exec(`
+      DELETE FROM ${table.name} WHERE hash_seq IN (
+        SELECT cv.hash || '_' || cv.seq FROM content_vectors cv
+        WHERE NOT EXISTS (
+          SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+        )
       )
-    )
-  `);
+    `);
+  }
 
   // Delete from content_vectors
   db.exec(`
@@ -1075,6 +1101,45 @@ export function cleanupOrphanedVectors(db: Database): number {
  */
 export function vacuumDatabase(db: Database): void {
   db.exec(`VACUUM`);
+}
+
+// =============================================================================
+// Settings management
+// =============================================================================
+
+/**
+ * Get a setting from the settings table
+ * Returns null if not found
+ */
+export function getSetting(db: Database, key: string): string | null {
+  const result = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key) as { value: string } | undefined;
+  return result?.value || null;
+}
+
+/**
+ * Set a setting in the settings table
+ */
+export function setSetting(db: Database, key: string, value: string): void {
+  db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`).run(key, value);
+}
+
+/**
+ * Sanitize model name to a valid SQLite table name suffix.
+ * Replaces all non-alphanumeric characters with underscores.
+ * Example: "openai/text-embedding-3-small" → "openai_text_embedding_3_small"
+ */
+export function sanitizeModelKey(modelName: string): string {
+  return modelName.replace(/[^a-zA-Z0-9]/g, '_');
+}
+
+/**
+ * Get the active model name from database settings.
+ * Returns format: "provider/model" (e.g., "local/embeddinggemma", "openai/text-embedding-3-small")
+ */
+export function getActiveModelName(db: Database): string {
+  const provider = getSetting(db, "embedding_provider") || "local";
+  const model = getSetting(db, "embedding_model") || (provider === "local" ? DEFAULT_EMBED_MODEL : "");
+  return `${provider}/${model}`;
 }
 
 // =============================================================================
@@ -1958,10 +2023,14 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // =============================================================================
 
 export async function searchVec(db: Database, query: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
-  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
+  // Determine which vec table to use based on active model
+  const activeModel = getActiveModelName(db);
+  const vecTableName = `vectors_vec_${sanitizeModelKey(activeModel)}`;
+
+  const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(vecTableName);
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, true, session);
+  const embedding = await getEmbedding(query, true, db, session);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -1972,7 +2041,7 @@ export async function searchVec(db: Database, query: string, limit: number = 20,
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
   const vecResults = db.prepare(`
     SELECT hash_seq, distance
-    FROM vectors_vec
+    FROM ${vecTableName}
     WHERE embedding MATCH ? AND k = ?
   `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
 
@@ -1996,9 +2065,9 @@ export async function searchVec(db: Database, query: string, limit: number = 20,
     FROM content_vectors cv
     JOIN documents d ON d.hash = cv.hash AND d.active = 1
     JOIN content ON content.hash = d.hash
-    WHERE cv.hash || '_' || cv.seq IN (${placeholders})
+    WHERE cv.hash || '_' || cv.seq IN (${placeholders}) AND cv.model = ?
   `;
-  const params: string[] = [...hashSeqs];
+  const params: string[] = [...hashSeqs, activeModel];
 
   if (collectionName) {
     docSql += ` AND d.collection = ?`;
@@ -2047,9 +2116,10 @@ export async function searchVec(db: Database, query: string, limit: number = 20,
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
+async function getEmbedding(text: string, isQuery: boolean, db: Database, session?: ILLMSession): Promise<number[] | null> {
   const { getEmbeddingProvider } = await import("./embedding.js");
-  const provider = getEmbeddingProvider();
+
+  const provider = await getEmbeddingProvider(db);
 
   const formattedText = isQuery ? provider.formatQuery(text) : provider.formatDocument(text);
 
@@ -2067,15 +2137,16 @@ async function getEmbedding(text: string, isQuery: boolean, session?: ILLMSessio
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
-export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
+export function getHashesForEmbedding(db: Database, modelName?: string): { hash: string; body: string; path: string }[] {
+  const model = modelName || getActiveModelName(db);
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
     FROM documents d
     JOIN content c ON d.hash = c.hash
-    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0 AND v.model = ?
     WHERE d.active = 1 AND v.hash IS NULL
     GROUP BY d.hash
-  `).all() as { hash: string; body: string; path: string }[];
+  `).all(model) as { hash: string; body: string; path: string }[];
 }
 
 /**
@@ -2084,7 +2155,21 @@ export function getHashesForEmbedding(db: Database): { hash: string; body: strin
  */
 export function clearAllEmbeddings(db: Database): void {
   db.exec(`DELETE FROM content_vectors`);
-  db.exec(`DROP TABLE IF EXISTS vectors_vec`);
+  // Drop all vectors_vec* tables
+  const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vectors_vec%'`).all() as { name: string }[];
+  for (const table of tables) {
+    db.exec(`DROP TABLE IF EXISTS ${table.name}`);
+  }
+}
+
+/**
+ * Clear embeddings for a specific model only.
+ * Deletes rows from content_vectors for this model and drops the model's vec table.
+ */
+export function clearEmbeddingsForModel(db: Database, modelName: string): void {
+  db.prepare(`DELETE FROM content_vectors WHERE model = ?`).run(modelName);
+  const vecTableName = `vectors_vec_${sanitizeModelKey(modelName)}`;
+  db.exec(`DROP TABLE IF EXISTS ${vecTableName}`);
 }
 
 /**
@@ -2101,7 +2186,8 @@ export function insertEmbedding(
   embeddedAt: string
 ): void {
   const hashSeq = `${hash}_${seq}`;
-  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`);
+  const vecTableName = `vectors_vec_${sanitizeModelKey(model)}`;
+  const insertVecStmt = db.prepare(`INSERT OR REPLACE INTO ${vecTableName} (hash_seq, embedding) VALUES (?, ?)`);
   const insertContentVectorStmt = db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`);
 
   insertVecStmt.run(hashSeq, embedding);

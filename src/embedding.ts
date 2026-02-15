@@ -5,7 +5,7 @@
  */
 
 import { getDefaultLlamaCpp, formatQueryForEmbedding, formatDocForEmbedding, type EmbeddingResult, type ILLMSession } from "./llm";
-import { getEmbeddingConfig, type EmbeddingConfig } from "./collections";
+import type { Database } from "bun:sqlite";
 
 // =============================================================================
 // Provider Interface
@@ -84,13 +84,13 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private apiKey: string;
   private baseUrl: string;
 
-  constructor(config: EmbeddingConfig) {
-    this.modelId = config.model || "text-embedding-3-small";
-    this.apiKey = config.api_key || process.env.OPENAI_API_KEY || "";
-    this.baseUrl = config.base_url || "https://api.openai.com/v1";
+  constructor(modelId?: string) {
+    this.modelId = modelId || "text-embedding-3-small";
+    this.apiKey = process.env.OPENAI_API_KEY || "";
+    this.baseUrl = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 
     if (!this.apiKey) {
-      throw new Error("OpenAI API key required. Set api_key in config or OPENAI_API_KEY environment variable.");
+      throw new Error("OpenAI API key required. Set OPENAI_API_KEY environment variable.");
     }
 
     // Set known dimensions if available
@@ -196,12 +196,12 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
 
   private apiKey: string;
 
-  constructor(config: EmbeddingConfig) {
-    this.modelId = config.model || "text-embedding-004";
-    this.apiKey = config.api_key || process.env.GEMINI_API_KEY || "";
+  constructor(modelId?: string) {
+    this.modelId = modelId || "text-embedding-004";
+    this.apiKey = process.env.GEMINI_API_KEY || "";
 
     if (!this.apiKey) {
-      throw new Error("Gemini API key required. Set api_key in config or GEMINI_API_KEY environment variable.");
+      throw new Error("Gemini API key required. Set GEMINI_API_KEY environment variable.");
     }
 
     // Set known dimensions if available
@@ -296,37 +296,63 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
 let currentProvider: EmbeddingProvider | null = null;
 
 /**
- * Create an embedding provider from config
+ * Create an embedding provider from database settings or CLI override
+ *
+ * @param db - Database instance
+ * @param overrideProvider - Optional CLI override for provider name (e.g., "local", "openai", "gemini")
+ * @param overrideModel - Optional CLI override for model ID
  */
-export function createEmbeddingProvider(config?: EmbeddingConfig): EmbeddingProvider {
-  const providerConfig = config || getEmbeddingConfig();
+export async function createEmbeddingProvider(
+  db: Database,
+  overrideProvider?: string,
+  overrideModel?: string
+): Promise<EmbeddingProvider> {
+  const { getSetting } = await import("./store.js");
 
-  switch (providerConfig.provider) {
+  // Use override if provided, otherwise read from DB settings
+  const provider = overrideProvider || getSetting(db, "embedding_provider") || "local";
+  const model = overrideModel || getSetting(db, "embedding_model");
+
+  switch (provider) {
     case "local":
       return new LocalEmbeddingProvider();
     case "openai":
-      return new OpenAIEmbeddingProvider(providerConfig);
+      return new OpenAIEmbeddingProvider(model || undefined);
     case "gemini":
-      return new GeminiEmbeddingProvider(providerConfig);
+      return new GeminiEmbeddingProvider(model || undefined);
     default:
-      throw new Error(`Unknown embedding provider: ${providerConfig.provider}`);
+      throw new Error(`Unknown embedding provider: ${provider}`);
   }
 }
 
 /**
  * Get the current embedding provider singleton
- * Creates one from config if not already set
+ * Creates one from DB settings if not already set
+ *
+ * @param db - Database instance
+ * @param overrideProvider - Optional CLI override for provider name
+ * @param overrideModel - Optional CLI override for model ID
  */
-export function getEmbeddingProvider(): EmbeddingProvider {
+export async function getEmbeddingProvider(
+  db: Database,
+  overrideProvider?: string,
+  overrideModel?: string
+): Promise<EmbeddingProvider> {
+  // If override is provided, always create fresh provider (don't use singleton)
+  if (overrideProvider) {
+    return await createEmbeddingProvider(db, overrideProvider, overrideModel);
+  }
+
+  // Otherwise use singleton pattern
   if (!currentProvider) {
-    currentProvider = createEmbeddingProvider();
+    currentProvider = await createEmbeddingProvider(db);
   }
   return currentProvider;
 }
 
 /**
  * Set the current embedding provider
- * Pass null to reset (will recreate from config on next getEmbeddingProvider call)
+ * Pass null to reset (will recreate from DB on next getEmbeddingProvider call)
  */
 export function setEmbeddingProvider(provider: EmbeddingProvider | null): void {
   currentProvider = provider;

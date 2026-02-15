@@ -32,22 +32,11 @@ export interface Collection {
 }
 
 /**
- * Embedding provider configuration
- */
-export interface EmbeddingConfig {
-  provider: "local" | "openai" | "gemini";
-  model?: string;
-  api_key?: string;
-  base_url?: string;
-}
-
-/**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
   collections: Record<string, Collection>;    // Collection name -> config
-  embedding?: EmbeddingConfig;                // Embedding provider configuration
 }
 
 /**
@@ -400,11 +389,3 @@ export function isValidCollectionName(name: string): boolean {
   return /^[a-zA-Z0-9_-]+$/.test(name);
 }
 
-/**
- * Get embedding configuration from config file
- * Returns default (local provider) if not configured
- */
-export function getEmbeddingConfig(): EmbeddingConfig {
-  const config = loadConfig();
-  return config.embedding || { provider: "local" };
-}

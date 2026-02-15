@@ -22,7 +22,6 @@ import {
   matchFilesByGlob,
   getHashesNeedingEmbedding,
   getHashesForEmbedding,
-  clearAllEmbeddings,
   insertEmbedding,
   getStatus,
   hashContent,
@@ -122,9 +121,9 @@ function setIndexName(name: string | null): void {
   closeDb();
 }
 
-function ensureVecTable(_db: Database, dimensions: number): void {
+function ensureVecTable(_db: Database, dimensions: number, modelKey?: string): void {
   // Store owns the DB; ignore `_db` and ensure vec table on the active store
-  getStore().ensureVecTable(dimensions);
+  getStore().ensureVecTable(dimensions, modelKey);
 }
 
 // Terminal colors (respects NO_COLOR env)
@@ -136,6 +135,7 @@ const c = {
   cyan: useColor ? "\x1b[36m" : "",
   yellow: useColor ? "\x1b[33m" : "",
   green: useColor ? "\x1b[32m" : "",
+  red: useColor ? "\x1b[31m" : "",
   magenta: useColor ? "\x1b[35m" : "",
   blue: useColor ? "\x1b[34m" : "",
 };
@@ -194,6 +194,8 @@ function checkIndexHealth(db: Database): void {
   }
 }
 
+// Removed: checkEmbeddingProviderMatch - no longer needed with multi-provider support
+
 // Compute unique display path for a document
 // Always include at least parent folder + filename, add more parent dirs until unique
 function computeDisplayPath(
@@ -249,6 +251,110 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+async function setProvider(providerName?: string, modelId?: string): Promise<void> {
+  const store = getStore();
+  const db = store.db;
+
+  // Model options for each provider
+  const OPENAI_MODELS = ["text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"];
+  const GEMINI_MODELS = ["text-embedding-004", "embedding-001"];
+
+  if (!providerName) {
+    // Interactive mode
+    console.log(`${c.bold}Select Embedding Provider${c.reset}\n`);
+
+    // Show current setting
+    const currentProvider = store.getSetting("embedding_provider") || "local";
+    const currentModel = store.getSetting("embedding_model") || "";
+    console.log(`Current: ${currentProvider}${currentModel ? `/${currentModel}` : ""}\n`);
+
+    console.log("1. local (embeddinggemma, 768 dimensions)");
+    console.log("2. openai (requires OPENAI_API_KEY)");
+    console.log("3. gemini (requires GEMINI_API_KEY)");
+    console.log("");
+
+    // Read user choice
+    process.stdout.write("Select provider (1-3): ");
+    const choice = prompt();
+    if (!choice) {
+      console.log("Cancelled.");
+      closeDb();
+      return;
+    }
+
+    const providers = ["local", "openai", "gemini"];
+    const selectedProvider = providers[parseInt(choice) - 1];
+
+    if (!selectedProvider) {
+      console.error("Invalid choice.");
+      closeDb();
+      process.exit(1);
+    }
+
+    providerName = selectedProvider;
+
+    // Prompt for model selection if remote provider
+    if (providerName === "openai") {
+      console.log("\nAvailable OpenAI models:");
+      OPENAI_MODELS.forEach((m, i) => console.log(`${i + 1}. ${m}`));
+      process.stdout.write(`Select model (1-${OPENAI_MODELS.length}, default: 1): `);
+      const modelChoice = prompt() || "1";
+      modelId = OPENAI_MODELS[parseInt(modelChoice) - 1] || OPENAI_MODELS[0];
+    } else if (providerName === "gemini") {
+      console.log("\nAvailable Gemini models:");
+      GEMINI_MODELS.forEach((m, i) => console.log(`${i + 1}. ${m}`));
+      process.stdout.write(`Select model (1-${GEMINI_MODELS.length}, default: 1): `);
+      const modelChoice = prompt() || "1";
+      modelId = GEMINI_MODELS[parseInt(modelChoice) - 1] || GEMINI_MODELS[0];
+    } else {
+      modelId = "embeddinggemma";
+    }
+  } else {
+    // Non-interactive mode
+    if (!["local", "openai", "gemini"].includes(providerName)) {
+      console.error(`Unknown provider: ${providerName}`);
+      console.error("Valid providers: local, openai, gemini");
+      closeDb();
+      process.exit(1);
+    }
+
+    // Set default models if not specified
+    if (!modelId) {
+      if (providerName === "local") {
+        modelId = "embeddinggemma";
+      } else if (providerName === "openai") {
+        modelId = "text-embedding-3-small";
+      } else if (providerName === "gemini") {
+        modelId = "text-embedding-004";
+      }
+    }
+  }
+
+  // Save to DB
+  store.setSetting("embedding_provider", providerName);
+  store.setSetting("embedding_model", modelId!);
+
+  console.log(`\n${c.green}✓${c.reset} Embedding provider set to: ${c.bold}${providerName}/${modelId}${c.reset}`);
+
+  // Show info about existing embeddings
+  const allModels = db.prepare(`SELECT DISTINCT model FROM content_vectors ORDER BY model`).all() as { model: string }[];
+  if (allModels.length > 0) {
+    const newModelName = `${providerName}/${modelId}`;
+    const hasNewModel = allModels.some(m => m.model === newModelName);
+
+    if (!hasNewModel) {
+      console.log(`\n${c.dim}Existing embeddings: ${allModels.map(m => m.model).join(', ')}${c.reset}`);
+      console.log(`Run ${c.bold}qmd embed${c.reset} to create embeddings with the new provider.`);
+    } else {
+      console.log(`\n${c.dim}Embeddings already exist for ${newModelName}${c.reset}`);
+    }
+  } else {
+    console.log(`\n${c.dim}No embeddings yet. Run ${c.bold}qmd embed${c.reset} to create them.${c.reset}`);
+  }
+
+  closeDb();
+}
+
 function showStatus(): void {
   const dbPath = getDbPath();
   const db = getDb();
@@ -269,7 +375,8 @@ function showStatus(): void {
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
   const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const needsEmbedding = getHashesNeedingEmbedding(db);
+  const store = getStore();
+  const needsEmbedding = store.getHashesNeedingEmbedding();
 
   // Most recent update across all collections
   const mostRecent = db.prepare(`SELECT MAX(modified_at) as latest FROM documents WHERE active = 1`).get() as { latest: string | null };
@@ -291,6 +398,29 @@ function showStatus(): void {
     } catch {
       unlinkSync(mcpPidPath);
       // Stale PID file cleaned up silently
+    }
+  }
+  console.log("");
+
+  // Embedding provider
+  const activeProvider = store.getSetting("embedding_provider") || "local";
+  const activeModel = store.getSetting("embedding_model") || "";
+  const activeModelName = `${activeProvider}${activeModel ? `/${activeModel}` : ""}`;
+
+  // Get all embedding versions from content_vectors
+  const allModels = db.prepare(`SELECT DISTINCT model FROM content_vectors ORDER BY model`).all() as { model: string }[];
+
+  console.log(`${c.bold}Embedding${c.reset}`);
+  if (allModels.length === 0) {
+    console.log(`  Active: ${activeModelName} ${c.dim}(no embeddings yet, run 'qmd embed')${c.reset}`);
+  } else {
+    console.log(`  Active: ${c.green}${activeModelName}${c.reset}`);
+    console.log(`  Versions:`);
+    for (const { model } of allModels) {
+      const count = db.prepare(`SELECT COUNT(*) as c FROM content_vectors WHERE model = ?`).get(model) as { c: number };
+      const isActive = model === activeModelName ? " (active)" : "";
+      const color = model === activeModelName ? c.green : c.dim;
+      console.log(`    ${color}${model}: ${count.c} vectors${isActive}${c.reset}`);
     }
   }
   console.log("");
@@ -1484,38 +1614,25 @@ function renderProgressBar(percent: number, width: number = 30): string {
 
 async function vectorIndex(force: boolean = false): Promise<void> {
   const db = getDb();
+  const store = getStore();
   const now = new Date().toISOString();
 
   // Get embedding provider
   const { getEmbeddingProvider } = await import("./embedding.js");
   const { chunkDocument } = await import("./store.js");
-  const provider = getEmbeddingProvider();
+  const provider = await getEmbeddingProvider(db);
   const modelName = `${provider.name}/${provider.modelId}`;
 
-  // Check for model mismatch
-  if (!force) {
-    const existingModel = db.prepare(`
-      SELECT DISTINCT model FROM content_vectors LIMIT 1
-    `).get() as { model: string } | undefined;
+  console.log(`${c.dim}Provider: ${provider.name}/${provider.modelId}${c.reset}`);
 
-    if (existingModel && existingModel.model !== modelName) {
-      console.error(`${c.yellow}Error: Existing embeddings use a different model.${c.reset}`);
-      console.error(`  Current: ${existingModel.model}`);
-      console.error(`  New: ${modelName}`);
-      console.error(`\nUse --force to clear existing embeddings and re-index with the new provider.`);
-      closeDb();
-      process.exit(1);
-    }
-  }
-
-  // If force, clear all vectors
+  // If force, clear only this model's vectors
   if (force) {
-    console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
-    clearAllEmbeddings(db);
+    console.log(`${c.yellow}Force re-indexing: clearing ${modelName} vectors...${c.reset}`);
+    store.clearEmbeddingsForModel(modelName);
   }
 
-  // Find unique hashes that need embedding (from active documents)
-  const hashesToEmbed = getHashesForEmbedding(db);
+  // Find unique hashes that need embedding for this model (from active documents)
+  const hashesToEmbed = store.getHashesForEmbedding(modelName);
 
   if (hashesToEmbed.length === 0) {
     console.log(`${c.green}✓ All content hashes already have embeddings.${c.reset}`);
@@ -1622,7 +1739,9 @@ async function embedAllChunks(
   if (!firstResult) {
     throw new Error("Failed to get embedding dimensions from first chunk");
   }
-  ensureVecTable(db, firstResult.embedding.length);
+
+  // Ensure model-specific vec table exists
+  getStore().ensureVecTable(firstResult.embedding.length, modelName);
 
   let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
   const startTime = Date.now();
@@ -2072,7 +2191,7 @@ async function querySearch(query: string, opts: OutputOptions): Promise<void> {
 }
 
 // Parse CLI arguments using util.parseArgs
-function parseCLI() {
+async function parseCLI() {
   const { values, positionals } = parseArgs({
     args: Bun.argv.slice(2), // Skip bun and script path
     options: {
@@ -2102,9 +2221,11 @@ function parseCLI() {
       // Collection options
       name: { type: "string" },  // collection name
       mask: { type: "string" },  // glob pattern
+      // Provider options
+      provider: { type: "string" },  // embedding provider (local, openai, gemini)
+      model: { type: "string" },  // model ID for provider
       // Embed options
       force: { type: "boolean", short: "f" },
-      provider: { type: "string" },  // openai|gemini|local
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2127,6 +2248,17 @@ function parseCLI() {
   if (indexName) {
     setIndexName(indexName);
     setConfigIndexName(indexName);
+  }
+
+  // Handle --provider CLI override (sets embedding provider for this session only)
+  const cliProvider = values.provider as string | undefined;
+  const cliModel = values.model as string | undefined;
+  if (cliProvider) {
+    // Import dynamically to avoid circular dependency
+    const { createEmbeddingProvider, setEmbeddingProvider } = await import("./embedding.js");
+    const db = getDb();
+    const provider = await createEmbeddingProvider(db, cliProvider, cliModel);
+    setEmbeddingProvider(provider);
   }
 
   // Determine output format
@@ -2175,7 +2307,8 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f] [--provider]   - Create vector embeddings (800 tokens/chunk, 15% overlap)");
+  console.log("  qmd provider [name] [--model] - Set embedding provider (interactive or direct)");
+  console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
   console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
@@ -2188,11 +2321,14 @@ function showHelp(): void {
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
   console.log("");
+  console.log("Provider options:");
+  console.log("  qmd provider               - Interactive provider selection");
+  console.log("  qmd provider <name>        - Set provider (local, openai, gemini)");
+  console.log("  --model <id>               - Specify model ID for remote providers");
+  console.log("                               Requires OPENAI_API_KEY or GEMINI_API_KEY env var");
+  console.log("");
   console.log("Embed options:");
   console.log("  -f, --force                - Clear existing embeddings and re-index");
-  console.log("  --provider <name>          - Override embedding provider (local, openai, gemini)");
-  console.log("                               Set in ~/.config/qmd/index.yml or use env vars:");
-  console.log("                               OPENAI_API_KEY for OpenAI, GEMINI_API_KEY for Gemini");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
@@ -2243,7 +2379,7 @@ async function showVersion(): Promise<void> {
 
 // Main CLI - only run if this is the main module
 if (import.meta.main) {
-  const cli = parseCLI();
+  const cli = await parseCLI();
 
   if (cli.values.version) {
     await showVersion();
@@ -2419,36 +2555,17 @@ if (import.meta.main) {
       showStatus();
       break;
 
+    case "provider":
+      await setProvider(cli.args[0], cli.values.model as string | undefined);
+      break;
+
     case "update":
       await updateCollections();
       break;
 
-    case "embed": {
-      // Override provider if --provider flag given
-      if (cli.values.provider) {
-        const { setEmbeddingProvider, createEmbeddingProvider } = await import("./embedding.js");
-        const { loadConfig, saveConfig } = await import("./collections.js");
-        const config = loadConfig();
-        const providerName = String(cli.values.provider);
-
-        if (!["local", "openai", "gemini"].includes(providerName)) {
-          console.error(`Unknown provider: ${providerName}`);
-          console.error(`Valid providers: local, openai, gemini`);
-          process.exit(1);
-        }
-
-        // Create temporary provider config
-        const embeddingConfig = {
-          provider: providerName as "local" | "openai" | "gemini",
-          ...config.embedding,
-        };
-
-        setEmbeddingProvider(createEmbeddingProvider(embeddingConfig));
-      }
-
+    case "embed":
       await vectorIndex(!!cli.values.force);
       break;
-    }
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);

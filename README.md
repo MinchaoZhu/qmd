@@ -295,44 +295,89 @@ qmd ls notes/subfolder
 
 QMD supports three embedding providers: **local** (embeddinggemma via node-llama-cpp), **OpenAI**, and **Gemini**.
 
+#### Multi-Provider Support
+
+Multiple embedding providers can coexist in the same index. Each provider/model combination maintains its own isolated embeddings, allowing you to:
+- Compare different embedding models on the same content
+- Switch between providers without losing existing embeddings
+- Use different providers for different search scenarios
+
 ```sh
-# Embed with default provider (local)
+# Set active provider (interactive)
+qmd provider
+
+# Set active provider (non-interactive)
+qmd provider local
+qmd provider openai
+qmd provider openai --model text-embedding-3-large
+qmd provider gemini
+
+# Embed with active provider
 qmd embed
 
-# Override provider via CLI
+# Embed with specific provider (doesn't change active setting)
 qmd embed --provider openai
 qmd embed --provider gemini
 
-# Force re-embed everything (required when changing providers)
+# Force re-embed with current provider only
 qmd embed -f
+
+# Search using active provider
+qmd vsearch "query"
+qmd query "query"
+
+# Search using different provider (temporary override)
+qmd vsearch --provider local "query"
+qmd query --provider openai "query"
 ```
 
-**Configure embedding provider** in `~/.config/qmd/index.yml`:
+#### Provider Configuration
 
-```yaml
-# OpenAI (supports custom base_url for OpenAI-compatible APIs)
-embedding:
-  provider: openai
-  model: text-embedding-3-small  # or text-embedding-3-large
-  api_key: sk-...                # optional, uses OPENAI_API_KEY env var
-  base_url: https://api.openai.com/v1  # optional, for Ollama/Together.ai/etc
+**Set the active provider:**
+```sh
+# Interactive selection
+qmd provider
 
-# Gemini
-embedding:
-  provider: gemini
-  model: text-embedding-004      # default
-  api_key: ...                   # optional, uses GEMINI_API_KEY env var
-
-# Local (default, no config needed)
-embedding:
-  provider: local
+# Direct configuration
+qmd provider openai
+qmd provider openai --model text-embedding-3-large
+qmd provider gemini --model text-embedding-004
+qmd provider local  # default
 ```
 
 **Environment variables:**
-- `OPENAI_API_KEY` - OpenAI API key (falls back to config `api_key`)
-- `GEMINI_API_KEY` - Gemini API key (falls back to config `api_key`)
+- `OPENAI_API_KEY` - OpenAI API key
+- `OPENAI_BASE_URL` - Custom OpenAI-compatible endpoint (optional)
+- `GEMINI_API_KEY` - Gemini API key
 
-**Note:** Changing embedding providers requires `--force` to re-embed all documents, as different models produce incompatible vector spaces.
+**Supported models:**
+
+| Provider | Models | Dimensions |
+|----------|--------|------------|
+| `local` | `embeddinggemma` | 768 |
+| `openai` | `text-embedding-3-small`<br>`text-embedding-3-large`<br>`text-embedding-ada-002` | 1536<br>3072<br>1536 |
+| `gemini` | `text-embedding-004`<br>`embedding-001` | 768<br>768 |
+
+**View embedding status:**
+```sh
+qmd status
+```
+
+Output shows all embedding versions:
+```
+Embedding
+  Active: openai/text-embedding-3-small
+  Versions:
+    local/embeddinggemma: 5029 vectors
+    openai/text-embedding-3-small: 5029 vectors
+    gemini/text-embedding-004: 0 vectors (run 'qmd embed')
+```
+
+**Notes:**
+- Each provider/model maintains separate embeddings (isolated vec tables)
+- Switching providers doesn't require re-embedding unless you want to use the new provider
+- Use `qmd embed -f` to re-embed only the active provider's embeddings
+- The `--provider` flag works with `embed`, `vsearch`, and `query` commands
 
 ### Context Management
 
@@ -456,6 +501,22 @@ qmd query --json "quarterly reports"
 qmd --index work search "quarterly reports"
 ```
 
+### Provider Management
+
+```sh
+# Set active embedding provider (interactive)
+qmd provider
+
+# Set active provider (non-interactive)
+qmd provider local
+qmd provider openai
+qmd provider openai --model text-embedding-3-large
+qmd provider gemini
+
+# View current provider and all embedding versions
+qmd status
+```
+
 ### Index Maintenance
 
 ```sh
@@ -500,13 +561,17 @@ Index stored in: `~/.cache/qmd/index.sqlite`
 ### Schema
 
 ```sql
-collections     -- Indexed directories with name and glob patterns
-path_contexts   -- Context descriptions by virtual path (qmd://...)
-documents       -- Markdown content with metadata and docid (6-char hash)
-documents_fts   -- FTS5 full-text index
-content_vectors -- Embedding chunks (hash, seq, pos, 800 tokens each)
-vectors_vec     -- sqlite-vec vector index (hash_seq key)
-llm_cache       -- Cached LLM responses (query expansion, rerank scores)
+collections          -- Indexed directories with name and glob patterns
+path_contexts        -- Context descriptions by virtual path (qmd://...)
+documents            -- Markdown content with metadata and docid (6-char hash)
+documents_fts        -- FTS5 full-text index
+content_vectors      -- Embedding chunks (hash, seq, pos, model, 800 tokens each)
+                     -- PK: (hash, seq, model) - allows multiple embeddings per document
+vectors_vec_{model}  -- Model-namespaced sqlite-vec indexes (hash_seq key)
+                     -- e.g., vectors_vec_local_embeddinggemma
+                     --       vectors_vec_openai_text_embedding_3_small
+llm_cache            -- Cached LLM responses (query expansion, rerank scores)
+settings             -- Database settings (active embedding provider/model)
 ```
 
 ## Environment Variables
@@ -514,6 +579,9 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
+| `OPENAI_API_KEY` | - | OpenAI API key for embedding provider |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Custom OpenAI-compatible endpoint |
+| `GEMINI_API_KEY` | - | Google Gemini API key for embedding provider |
 
 ## How It Works
 
@@ -534,16 +602,23 @@ Collection ──► Glob Pattern ──► Markdown Files ──► Parse Title
 
 ### Embedding Flow
 
-Documents are chunked into 800-token pieces with 15% overlap:
+Documents are chunked into 800-token pieces with 15% overlap (local provider) or 3200-character pieces (remote providers):
 
 ```
-Document ──► Chunk (800 tokens) ──► Format each chunk ──► node-llama-cpp ──► Store Vectors
-                │                    "title | text"        embedBatch()
+Document ──► Chunk (800 tokens) ──► Format each chunk ──► Embedding Provider ──► Store Vectors
+                │                    provider-specific      (local/openai/gemini)
+                │                    formatting
                 │
                 └─► Chunks stored with:
                     - hash: document hash
                     - seq: chunk sequence (0, 1, 2...)
                     - pos: character position in original
+                    - model: provider/model identifier (e.g., "local/embeddinggemma")
+
+Vectors stored in model-namespaced tables:
+    ├─ vectors_vec_local_embeddinggemma
+    ├─ vectors_vec_openai_text_embedding_3_small
+    └─ vectors_vec_gemini_text_embedding_004
 ```
 
 ### Query Flow (Hybrid)
@@ -588,7 +663,7 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ### Embedding Providers
 
-QMD supports three embedding providers configured in `~/.config/qmd/index.yml`:
+QMD supports three embedding providers. Multiple providers can coexist in the same index, with an "active" provider controlling which embeddings are used for search:
 
 1. **Local (embeddinggemma)** - Default, runs via node-llama-cpp
    - Model: `hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf`
@@ -600,10 +675,18 @@ QMD supports three embedding providers configured in `~/.config/qmd/index.yml`:
    - Models: `text-embedding-3-small` (1536d), `text-embedding-3-large` (3072d)
    - Supports OpenAI-compatible endpoints (Ollama, Together.ai, Azure OpenAI)
    - Character-based chunking (3200 chars/chunk)
+   - Requires `OPENAI_API_KEY` environment variable
 
 3. **Gemini** - Google's embedding API
    - Model: `text-embedding-004` (768d)
    - Character-based chunking (3200 chars/chunk)
+   - Requires `GEMINI_API_KEY` environment variable
+
+**Provider Management:**
+- Set active provider: `qmd provider <name>`
+- CLI override: `--provider <name>` (temporary, doesn't change DB setting)
+- Each provider maintains isolated embeddings in separate vec tables
+- Switch providers without re-embedding (embeddings persist)
 
 **Reranking & Query Expansion** (local only):
 
