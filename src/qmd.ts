@@ -1482,9 +1482,31 @@ function renderProgressBar(percent: number, width: number = 30): string {
   return bar;
 }
 
-async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean = false): Promise<void> {
+async function vectorIndex(force: boolean = false): Promise<void> {
   const db = getDb();
   const now = new Date().toISOString();
+
+  // Get embedding provider
+  const { getEmbeddingProvider } = await import("./embedding.js");
+  const { chunkDocument } = await import("./store.js");
+  const provider = getEmbeddingProvider();
+  const modelName = `${provider.name}/${provider.modelId}`;
+
+  // Check for model mismatch
+  if (!force) {
+    const existingModel = db.prepare(`
+      SELECT DISTINCT model FROM content_vectors LIMIT 1
+    `).get() as { model: string } | undefined;
+
+    if (existingModel && existingModel.model !== modelName) {
+      console.error(`${c.yellow}Error: Existing embeddings use a different model.${c.reset}`);
+      console.error(`  Current: ${existingModel.model}`);
+      console.error(`  New: ${modelName}`);
+      console.error(`\nUse --force to clear existing embeddings and re-index with the new provider.`);
+      closeDb();
+      process.exit(1);
+    }
+  }
 
   // If force, clear all vectors
   if (force) {
@@ -1502,12 +1524,14 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   }
 
   // Prepare documents with chunks
-  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number; displayName: string };
+  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens?: number; bytes: number; displayName: string };
   const allChunks: ChunkItem[] = [];
   let multiChunkDocs = 0;
 
-  // Chunk all documents using actual token counts
-  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by token count...\n`);
+  // Chunk all documents - use tokenizer if available, otherwise character-based
+  const chunkMethod = provider.hasTokenizer ? "token count" : "characters";
+  process.stderr.write(`Chunking ${hashesToEmbed.length} documents by ${chunkMethod}...\n`);
+
   for (const item of hashesToEmbed) {
     const encoder = new TextEncoder();
     const bodyBytes = encoder.encode(item.body).length;
@@ -1515,19 +1539,24 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
     const title = extractTitle(item.body, item.path);
     const displayName = item.path;
-    const chunks = await chunkDocumentByTokens(item.body);  // Uses actual tokenizer
+
+    // Choose chunking method based on provider capabilities
+    const chunks = provider.hasTokenizer
+      ? await chunkDocumentByTokens(item.body)  // Token-based for local
+      : chunkDocument(item.body);                // Character-based for remote
 
     if (chunks.length > 1) multiChunkDocs++;
 
     for (let seq = 0; seq < chunks.length; seq++) {
+      const chunkData = chunks[seq]!;
       allChunks.push({
         hash: item.hash,
         title,
-        text: chunks[seq]!.text, // Chunk is guaranteed to exist by seq loop
+        text: chunkData.text,
         seq,
-        pos: chunks[seq]!.pos,
-        tokens: chunks[seq]!.tokens,
-        bytes: encoder.encode(chunks[seq]!.text).length,
+        pos: chunkData.pos,
+        tokens: 'tokens' in chunkData ? chunkData.tokens : undefined,
+        bytes: encoder.encode(chunkData.text).length,
         displayName,
       });
     }
@@ -1547,109 +1576,137 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Provider: ${provider.name}${c.reset}`);
+  console.log(`${c.dim}Model: ${provider.modelId}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
 
-  // Wrap all LLM embedding operations in a session for lifecycle management
-  // Use 30 minute timeout for large collections
-  await withLLMSession(async (session) => {
-    // Get embedding dimensions from first chunk
-    progress.indeterminate();
-    const firstChunk = allChunks[0];
-    if (!firstChunk) {
-      throw new Error("No chunks available to embed");
-    }
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
-    if (!firstResult) {
-      throw new Error("Failed to get embedding dimensions from first chunk");
-    }
-    ensureVecTable(db, firstResult.embedding.length);
+  // Embedding logic - use session for local, direct for remote
+  if (provider.name === "local") {
+    // Local provider - use withLLMSession for lifecycle management
+    await withLLMSession(async (session) => {
+      await embedAllChunks(db, allChunks, provider, session, modelName, now, totalBytes, totalChunks);
+    }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+  } else {
+    // Remote provider - no session needed
+    await embedAllChunks(db, allChunks, provider, undefined, modelName, now, totalBytes, totalChunks);
+  }
 
-    let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
-    const startTime = Date.now();
+  closeDb();
+}
 
-    // Batch embedding for better throughput
-    // Process in batches of 32 to balance memory usage and efficiency
-    const BATCH_SIZE = 32;
+// Helper function to embed all chunks (extracted for reuse between local and remote)
+async function embedAllChunks(
+  db: Database,
+  allChunks: Array<{ hash: string; title: string; text: string; seq: number; pos: number; bytes: number; displayName: string }>,
+  provider: any,
+  session: any,
+  modelName: string,
+  now: string,
+  totalBytes: number,
+  totalChunks: number
+): Promise<void> {
+  // Get embedding dimensions from first chunk
+  progress.indeterminate();
+  const firstChunk = allChunks[0];
+  if (!firstChunk) {
+    throw new Error("No chunks available to embed");
+  }
+  const firstText = provider.formatDocument(firstChunk.text, firstChunk.title);
 
-    for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
-      const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
-      const batch = allChunks.slice(batchStart, batchEnd);
+  const firstResult = session
+    ? await session.embed(firstText)
+    : await provider.embed(firstText, false);
 
-      // Format texts for embedding
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+  if (!firstResult) {
+    throw new Error("Failed to get embedding dimensions from first chunk");
+  }
+  ensureVecTable(db, firstResult.embedding.length);
 
-      try {
-        // Batch embed all texts at once
-        const embeddings = await session.embedBatch(texts);
+  let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
+  const startTime = Date.now();
 
-        // Insert each embedding
-        for (let i = 0; i < batch.length; i++) {
-          const chunk = batch[i]!;
-          const embedding = embeddings[i];
+  // Batch embedding for better throughput
+  const BATCH_SIZE = 32;
 
-          if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+  for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
+    const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
+    const batch = allChunks.slice(batchStart, batchEnd);
+
+    // Format texts for embedding
+    const texts = batch.map(chunk => provider.formatDocument(chunk.text, chunk.title));
+
+    try {
+      // Batch embed all texts at once
+      const embeddings = session
+        ? await session.embedBatch(texts)
+        : await provider.embedBatch(texts, false);
+
+      // Insert each embedding
+      for (let i = 0; i < batch.length; i++) {
+        const chunk = batch[i]!;
+        const embedding = embeddings[i];
+
+        if (embedding) {
+          insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), modelName, now);
+          chunksEmbedded++;
+        } else {
+          errors++;
+          console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
+        }
+        bytesProcessed += chunk.bytes;
+      }
+    } catch (err) {
+      // If batch fails, try individual embeddings as fallback
+      for (const chunk of batch) {
+        try {
+          const text = provider.formatDocument(chunk.text, chunk.title);
+          const result = session
+            ? await session.embed(text)
+            : await provider.embed(text, false);
+
+          if (result) {
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), modelName, now);
             chunksEmbedded++;
           } else {
             errors++;
-            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}${c.reset}`);
           }
-          bytesProcessed += chunk.bytes;
+        } catch (innerErr) {
+          errors++;
+          console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
         }
-      } catch (err) {
-        // If batch fails, try individual embeddings as fallback
-        for (const chunk of batch) {
-          try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
-            if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
-              chunksEmbedded++;
-            } else {
-              errors++;
-            }
-          } catch (innerErr) {
-            errors++;
-            console.error(`\n${c.yellow}⚠ Error embedding "${chunk.displayName}" chunk ${chunk.seq}: ${innerErr}${c.reset}`);
-          }
-          bytesProcessed += chunk.bytes;
-        }
+        bytesProcessed += chunk.bytes;
       }
-
-      const percent = (bytesProcessed / totalBytes) * 100;
-      progress.set(percent);
-
-      const elapsed = (Date.now() - startTime) / 1000;
-      const bytesPerSec = bytesProcessed / elapsed;
-      const remainingBytes = totalBytes - bytesProcessed;
-      const etaSec = remainingBytes / bytesPerSec;
-
-      const bar = renderProgressBar(percent);
-      const percentStr = percent.toFixed(0).padStart(3);
-      const throughput = `${formatBytes(bytesPerSec)}/s`;
-      const eta = elapsed > 2 ? formatETA(etaSec) : "...";
-      const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
-
-      process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
     }
 
-    progress.clear();
-    cursor.show();
-    const totalTimeSec = (Date.now() - startTime) / 1000;
-    const avgThroughput = formatBytes(totalBytes / totalTimeSec);
+    const percent = (bytesProcessed / totalBytes) * 100;
+    progress.set(percent);
 
-    console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
-    console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${totalDocs}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
-    if (errors > 0) {
-      console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
-    }
-  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+    const elapsed = (Date.now() - startTime) / 1000;
+    const bytesPerSec = bytesProcessed / elapsed;
+    const remainingBytes = totalBytes - bytesProcessed;
+    const etaSec = remainingBytes / bytesPerSec;
 
-  closeDb();
+    const bar = renderProgressBar(percent);
+    const percentStr = percent.toFixed(0).padStart(3);
+    const throughput = `${formatBytes(bytesPerSec)}/s`;
+    const eta = elapsed > 2 ? formatETA(etaSec) : "...";
+    const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
+
+    process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+  }
+
+  progress.clear();
+  cursor.show();
+  const totalTimeSec = (Date.now() - startTime) / 1000;
+  const avgThroughput = formatBytes(totalBytes / totalTimeSec);
+
+  console.log(`\r${c.green}${renderProgressBar(100)}${c.reset} ${c.bold}100%${c.reset}                                    `);
+  console.log(`\n${c.green}✓ Done!${c.reset} Embedded ${c.bold}${chunksEmbedded}${c.reset} chunks from ${c.bold}${allChunks.length}${c.reset} documents in ${c.bold}${formatETA(totalTimeSec)}${c.reset} ${c.dim}(${avgThroughput}/s)${c.reset}`);
+  if (errors > 0) {
+    console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
+  }
 }
 
 // Sanitize a term for FTS5: remove punctuation except apostrophes
@@ -1910,7 +1967,7 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
   for (const line of lines) process.stderr.write(line + '\n');
 }
 
-async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+async function vectorSearch(query: string, opts: OutputOptions): Promise<void> {
   const store = getStore();
 
   if (opts.collection) {
@@ -1956,7 +2013,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
-async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+async function querySearch(query: string, opts: OutputOptions): Promise<void> {
   const store = getStore();
 
   if (opts.collection) {
@@ -2047,6 +2104,7 @@ function parseCLI() {
       mask: { type: "string" },  // glob pattern
       // Embed options
       force: { type: "boolean", short: "f" },
+      provider: { type: "string" },  // openai|gemini|local
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2117,7 +2175,7 @@ function showHelp(): void {
   console.log("  qmd multi-get <pattern> [-l N] [--max-bytes N]  - Get multiple docs by glob or comma-separated list");
   console.log("  qmd status                    - Show index status and collections");
   console.log("  qmd update [--pull]           - Re-index all collections (--pull: git pull first)");
-  console.log("  qmd embed [-f]                - Create vector embeddings (800 tokens/chunk, 15% overlap)");
+  console.log("  qmd embed [-f] [--provider]   - Create vector embeddings (800 tokens/chunk, 15% overlap)");
   console.log("  qmd cleanup                   - Remove cache and orphaned data, vacuum DB");
   console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
   console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
@@ -2129,6 +2187,12 @@ function showHelp(): void {
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
+  console.log("");
+  console.log("Embed options:");
+  console.log("  -f, --force                - Clear existing embeddings and re-index");
+  console.log("  --provider <name>          - Override embedding provider (local, openai, gemini)");
+  console.log("                               Set in ~/.config/qmd/index.yml or use env vars:");
+  console.log("                               OPENAI_API_KEY for OpenAI, GEMINI_API_KEY for Gemini");
   console.log("");
   console.log("Search options:");
   console.log("  -n <num>                   - Number of results (default: 5, or 20 for --files)");
@@ -2148,8 +2212,12 @@ function showHelp(): void {
   console.log("  --max-bytes <num>          - Skip files larger than N bytes (default: 10240)");
   console.log("  --json/--csv/--md/--xml/--files - Output format (same as search)");
   console.log("");
-  console.log("Models (auto-downloaded from HuggingFace):");
-  console.log("  Embedding: embeddinggemma-300M-Q8_0");
+  console.log("Embedding providers:");
+  console.log("  local   - embeddinggemma-300M (auto-downloaded from HuggingFace)");
+  console.log("  openai  - text-embedding-3-small (default) or text-embedding-3-large");
+  console.log("  gemini  - text-embedding-004 (default)");
+  console.log("");
+  console.log("Other models (auto-downloaded from HuggingFace):");
   console.log("  Reranking: qwen3-reranker-0.6b-q8_0");
   console.log("  Generation: Qwen3-0.6B-Q8_0");
   console.log("");
@@ -2355,9 +2423,32 @@ if (import.meta.main) {
       await updateCollections();
       break;
 
-    case "embed":
-      await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force);
+    case "embed": {
+      // Override provider if --provider flag given
+      if (cli.values.provider) {
+        const { setEmbeddingProvider, createEmbeddingProvider } = await import("./embedding.js");
+        const { loadConfig, saveConfig } = await import("./collections.js");
+        const config = loadConfig();
+        const providerName = String(cli.values.provider);
+
+        if (!["local", "openai", "gemini"].includes(providerName)) {
+          console.error(`Unknown provider: ${providerName}`);
+          console.error(`Valid providers: local, openai, gemini`);
+          process.exit(1);
+        }
+
+        // Create temporary provider config
+        const embeddingConfig = {
+          provider: providerName as "local" | "openai" | "gemini",
+          ...config.embedding,
+        };
+
+        setEmbeddingProvider(createEmbeddingProvider(embeddingConfig));
+      }
+
+      await vectorIndex(!!cli.values.force);
       break;
+    }
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);

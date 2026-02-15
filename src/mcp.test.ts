@@ -296,12 +296,12 @@ describe("MCP Server", () => {
 
   describe("qmd_vector_search tool", () => {
     test("returns results for semantic query", async () => {
-      const results = await searchVec(testDb, "project documentation", DEFAULT_EMBED_MODEL, 10);
+      const results = await searchVec(testDb, "project documentation", 10);
       expect(results.length).toBeGreaterThan(0);
     });
 
     test("respects limit parameter", async () => {
-      const results = await searchVec(testDb, "documentation", DEFAULT_EMBED_MODEL, 2);
+      const results = await searchVec(testDb, "documentation", 2);
       expect(results.length).toBeLessThanOrEqual(2);
     });
 
@@ -310,7 +310,7 @@ describe("MCP Server", () => {
       initTestDatabase(emptyDb);
       emptyDb.exec("DROP TABLE IF EXISTS vectors_vec");
 
-      const results = await searchVec(emptyDb, "test", DEFAULT_EMBED_MODEL, 10);
+      const results = await searchVec(emptyDb, "test", 10);
       expect(results.length).toBe(0);
       emptyDb.close();
     });

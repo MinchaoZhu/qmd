@@ -217,7 +217,7 @@ describe("Vector Search", () => {
     const easyQueries = evalQueries.filter(q => q.difficulty === "easy");
     let hits = 0;
     for (const { query, expectedDoc } of easyQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await searchVec(db, query, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / easyQueries.length).toBeGreaterThanOrEqual(0.6);
@@ -229,7 +229,7 @@ describe("Vector Search", () => {
     const mediumQueries = evalQueries.filter(q => q.difficulty === "medium");
     let hits = 0;
     for (const { query, expectedDoc } of mediumQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await searchVec(db, query, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     // Vector search should do better on semantic queries than BM25
@@ -242,7 +242,7 @@ describe("Vector Search", () => {
     const hardQueries = evalQueries.filter(q => q.difficulty === "hard");
     let hits = 0;
     for (const { query, expectedDoc } of hardQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await searchVec(db, query, 5);
       if (results.some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / hardQueries.length).toBeGreaterThanOrEqual(0.3);
@@ -253,7 +253,7 @@ describe("Vector Search", () => {
 
     let hits = 0;
     for (const { query, expectedDoc } of evalQueries) {
-      const results = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const results = await searchVec(db, query, 5);
       if (results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) hits++;
     }
     expect(hits / evalQueries.length).toBeGreaterThanOrEqual(0.5);
@@ -303,7 +303,7 @@ describe("Hybrid Search (RRF)", () => {
     }
 
     // Vector results
-    const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 20);
+    const vecResults = await searchVec(db, query, 20);
     if (vecResults.length > 0) {
       rankedLists.push(vecResults.map(r => ({
         file: r.filepath,
@@ -373,7 +373,7 @@ describe("Hybrid Search (RRF)", () => {
       if (bm25Results.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) bm25Hits++;
 
       // Vector results for comparison
-      const vecResults = await searchVec(db, query, DEFAULT_EMBED_MODEL, 5);
+      const vecResults = await searchVec(db, query, 5);
       if (vecResults.slice(0, 3).some(r => matchesExpected(r.filepath, expectedDoc))) vecHits++;
     }
 

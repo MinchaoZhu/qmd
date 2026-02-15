@@ -670,7 +670,7 @@ export type Store = {
 
   // Search
   searchFTS: (query: string, limit?: number, collectionId?: number) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
+  searchVec: (query: string, limit?: number, collectionName?: string) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string) => Promise<ExpandedQuery[]>;
@@ -753,7 +753,7 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionId?: number) => searchFTS(db, query, limit, collectionId),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string) => searchVec(db, query, model, limit, collectionName),
+    searchVec: (query: string, limit?: number, collectionName?: string) => searchVec(db, query, limit, collectionName),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string) => expandQuery(query, model, db),
@@ -1957,11 +1957,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, limit: number = 20, collectionName?: string, session?: ILLMSession): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = await getEmbedding(query, model, true, session);
+  const embedding = await getEmbedding(query, true, session);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -2047,12 +2047,19 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
-  // Format text using the appropriate prompt template
-  const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
-  const result = session
-    ? await session.embed(formattedText, { model, isQuery })
-    : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
+async function getEmbedding(text: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
+  const { getEmbeddingProvider } = await import("./embedding.js");
+  const provider = getEmbeddingProvider();
+
+  const formattedText = isQuery ? provider.formatQuery(text) : provider.formatDocument(text);
+
+  // Use session for local provider, otherwise use provider directly
+  if (provider.name === "local" && session) {
+    const result = await session.embed(formattedText, { isQuery });
+    return result?.embedding || null;
+  }
+
+  const result = await provider.embed(formattedText, isQuery);
   return result?.embedding || null;
 }
 
@@ -2753,7 +2760,7 @@ export async function hybridQuery(
   // Vector searches run sequentially — node-llama-cpp's embed context
   // hangs on concurrent embed() calls (known limitation).
   if (hasVectors) {
-    const vecResults = await store.searchVec(query, DEFAULT_EMBED_MODEL, 20, collection);
+    const vecResults = await store.searchVec(query, 20, collection);
     if (vecResults.length > 0) {
       for (const r of vecResults) docidMap.set(r.filepath, r.docid);
       rankedLists.push(vecResults.map(r => ({
@@ -2779,7 +2786,7 @@ export async function hybridQuery(
     } else {
       // vec or hyde → vector search only
       if (hasVectors) {
-        const vecResults = await store.searchVec(q.text, DEFAULT_EMBED_MODEL, 20, collection);
+        const vecResults = await store.searchVec(q.text, 20, collection);
         if (vecResults.length > 0) {
           for (const r of vecResults) docidMap.set(r.filepath, r.docid);
           rankedLists.push(vecResults.map(r => ({
@@ -2922,7 +2929,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.text)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, limit, collection);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {

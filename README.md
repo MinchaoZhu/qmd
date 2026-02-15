@@ -293,13 +293,46 @@ qmd ls notes/subfolder
 
 ### Generate Vector Embeddings
 
+QMD supports three embedding providers: **local** (embeddinggemma via node-llama-cpp), **OpenAI**, and **Gemini**.
+
 ```sh
-# Embed all indexed documents (800 tokens/chunk, 15% overlap)
+# Embed with default provider (local)
 qmd embed
 
-# Force re-embed everything
+# Override provider via CLI
+qmd embed --provider openai
+qmd embed --provider gemini
+
+# Force re-embed everything (required when changing providers)
 qmd embed -f
 ```
+
+**Configure embedding provider** in `~/.config/qmd/index.yml`:
+
+```yaml
+# OpenAI (supports custom base_url for OpenAI-compatible APIs)
+embedding:
+  provider: openai
+  model: text-embedding-3-small  # or text-embedding-3-large
+  api_key: sk-...                # optional, uses OPENAI_API_KEY env var
+  base_url: https://api.openai.com/v1  # optional, for Ollama/Together.ai/etc
+
+# Gemini
+embedding:
+  provider: gemini
+  model: text-embedding-004      # default
+  api_key: ...                   # optional, uses GEMINI_API_KEY env var
+
+# Local (default, no config needed)
+embedding:
+  provider: local
+```
+
+**Environment variables:**
+- `OPENAI_API_KEY` - OpenAI API key (falls back to config `api_key`)
+- `GEMINI_API_KEY` - Gemini API key (falls back to config `api_key`)
+
+**Note:** Changing embedding providers requires `--force` to re-embed all documents, as different models produce incompatible vector spaces.
 
 ### Context Management
 
@@ -553,15 +586,33 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ## Model Configuration
 
-Models are configured in `src/llm.ts` as HuggingFace URIs:
+### Embedding Providers
+
+QMD supports three embedding providers configured in `~/.config/qmd/index.yml`:
+
+1. **Local (embeddinggemma)** - Default, runs via node-llama-cpp
+   - Model: `hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf`
+   - Dimensions: 768
+   - Uses nomic task-prefix format for queries/documents
+   - Supports token-based chunking (800 tokens/chunk)
+
+2. **OpenAI** - Remote API with custom base_url support
+   - Models: `text-embedding-3-small` (1536d), `text-embedding-3-large` (3072d)
+   - Supports OpenAI-compatible endpoints (Ollama, Together.ai, Azure OpenAI)
+   - Character-based chunking (3200 chars/chunk)
+
+3. **Gemini** - Google's embedding API
+   - Model: `text-embedding-004` (768d)
+   - Character-based chunking (3200 chars/chunk)
+
+**Reranking & Query Expansion** (local only):
 
 ```typescript
-const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
 
-### EmbeddingGemma Prompt Format
+### EmbeddingGemma Prompt Format (Local Provider)
 
 ```
 // For queries
@@ -570,6 +621,8 @@ const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query
 // For documents
 "title: {title} | text: {content}"
 ```
+
+**Note:** Remote providers (OpenAI, Gemini) use passthrough formatting without task prefixes.
 
 ### Qwen3-Reranker
 
