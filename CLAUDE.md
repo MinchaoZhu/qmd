@@ -23,10 +23,11 @@ qmd embed [-f]                    # Generate vector embeddings
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
+qmd daemon                        # Start daemon (foreground, holds DB + models)
+qmd daemon stop                   # Stop running daemon
+qmd daemon status                 # Show daemon status
 qmd mcp                           # Start MCP server (stdio transport)
 qmd mcp --http [--port N]         # Start MCP server (HTTP, default port 8181)
-qmd mcp --http --daemon           # Start as background daemon
-qmd mcp stop                      # Stop background MCP daemon
 ```
 
 ## Collection Management
@@ -123,6 +124,31 @@ bun src/qmd.ts <command>   # Run from source
 bun link               # Install globally as 'qmd'
 ```
 
+## Daemon Architecture
+
+QMD uses a persistent daemon process to keep the SQLite database and LLM models loaded in memory:
+
+- All CLI commands automatically connect to the daemon (auto-starts if needed)
+- Daemon holds the database connection and loaded models (~2.3GB)
+- Eliminates cold-start penalty for model loading
+- Runs until manually stopped or system restart (no auto-shutdown)
+- Uses Unix domain socket at `~/.cache/qmd/daemon.sock`
+- PID file at `~/.cache/qmd/daemon.pid`
+
+```sh
+# Start daemon manually (foreground)
+qmd daemon
+
+# Stop daemon
+qmd daemon stop
+
+# Check daemon status
+qmd daemon status
+
+# View daemon logs
+tail -f ~/.cache/qmd/daemon.log
+```
+
 ## Architecture
 
 - SQLite FTS5 for full-text search (BM25)
@@ -130,6 +156,7 @@ bun link               # Install globally as 'qmd'
 - node-llama-cpp for embeddings (embeddinggemma), reranking (qwen3-reranker), and query expansion (Qwen3)
 - Reciprocal Rank Fusion (RRF) for combining results
 - Token-based chunking: 800 tokens/chunk with 15% overlap
+- Persistent daemon process for fast CLI operations
 
 ## Important: Do NOT run automatically
 

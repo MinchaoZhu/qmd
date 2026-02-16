@@ -145,7 +145,7 @@ function buildInstructions(store: Store): string {
  * Create an MCP server with all QMD tools, resources, and prompts registered.
  * Shared by both stdio and HTTP transports.
  */
-function createMcpServer(store: Store): McpServer {
+export function createMcpServer(store: Store): McpServer {
   const server = new McpServer(
     { name: "qmd", version: "1.0.0" },
     { instructions: buildInstructions(store) },

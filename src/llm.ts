@@ -1206,3 +1206,18 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     defaultLlamaCpp = null;
   }
 }
+
+/**
+ * Get information about loaded models
+ */
+export function getLoadedModelInfo(): { embed: boolean; generate: boolean; rerank: boolean } {
+  if (!defaultLlamaCpp) {
+    return { embed: false, generate: false, rerank: false };
+  }
+
+  return {
+    embed: (defaultLlamaCpp as any).embedModel !== null,
+    generate: (defaultLlamaCpp as any).generateModel !== null,
+    rerank: (defaultLlamaCpp as any).rerankModel !== null,
+  };
+}

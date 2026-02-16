@@ -355,7 +355,7 @@ async function setProvider(providerName?: string, modelId?: string): Promise<voi
   closeDb();
 }
 
-function showStatus(): void {
+async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
 
@@ -385,20 +385,22 @@ function showStatus(): void {
   console.log(`Index: ${dbPath}`);
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
-  // MCP daemon status (check PID file liveness)
-  const mcpCacheDir = Bun.env.XDG_CACHE_HOME
-    ? resolve(Bun.env.XDG_CACHE_HOME, "qmd")
-    : resolve(homedir(), ".cache", "qmd");
-  const mcpPidPath = resolve(mcpCacheDir, "mcp.pid");
-  if (existsSync(mcpPidPath)) {
-    const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
-    try {
-      process.kill(mcpPid, 0);
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
-    } catch {
-      unlinkSync(mcpPidPath);
-      // Stale PID file cleaned up silently
+  // Daemon status
+  const { getDaemonStatus } = await import("./client.js");
+  const daemonStatus = await getDaemonStatus();
+  if (daemonStatus) {
+    const uptimeStr = formatETA(daemonStatus.uptime);
+    console.log(`Daemon: ${c.green}running${c.reset} (PID ${daemonStatus.pid}, uptime ${uptimeStr})`);
+    const models = [];
+    if (daemonStatus.loadedModels.embed) models.push("embed");
+    if (daemonStatus.loadedModels.generate) models.push("generate");
+    if (daemonStatus.loadedModels.rerank) models.push("rerank");
+    if (models.length > 0) {
+      console.log(`  Models: ${models.join(", ")}`);
     }
+    console.log(`  Requests: ${daemonStatus.requestCount}`);
+  } else {
+    console.log(`Daemon: ${c.dim}not running${c.reset}`);
   }
   console.log("");
 
@@ -2234,9 +2236,8 @@ async function parseCLI() {
       from: { type: "string" },  // start line
       "max-bytes": { type: "string" },  // max bytes for multi-get
       "line-numbers": { type: "boolean" },  // add line numbers to output
-      // MCP HTTP transport options
+      // MCP HTTP transport options (kept for backward compatibility)
       http: { type: "boolean" },
-      daemon: { type: "boolean" },
       port: { type: "string" },
     },
     allowPositionals: true,
@@ -2313,10 +2314,11 @@ function showHelp(): void {
   console.log("  qmd query <query>             - Search with query expansion + reranking (recommended)");
   console.log("  qmd search <query>            - Full-text keyword search (BM25, no LLM)");
   console.log("  qmd vsearch <query>           - Vector similarity search (no reranking)");
+  console.log("  qmd daemon                    - Start daemon (foreground)");
+  console.log("  qmd daemon stop               - Stop running daemon");
+  console.log("  qmd daemon status             - Show daemon status");
   console.log("  qmd mcp                       - Start MCP server (stdio transport)");
   console.log("  qmd mcp --http [--port N]     - Start MCP server (HTTP transport, default port 8181)");
-  console.log("  qmd mcp --http --daemon       - Start MCP server as background daemon");
-  console.log("  qmd mcp stop                  - Stop background MCP daemon");
   console.log("");
   console.log("Global options:");
   console.log("  --index <name>             - Use custom index name (default: index)");
@@ -2482,7 +2484,17 @@ if (import.meta.main) {
       }
       const fromLine = cli.values.from ? parseInt(cli.values.from as string, 10) : undefined;
       const maxLines = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
-      getDocument(cli.args[0], fromLine, maxLines, cli.opts.lineNumbers);
+      {
+        const { ensureDaemon } = await import("./client.js");
+        const client = await ensureDaemon();
+        const result = await client.request("get", {
+          file: cli.args[0],
+          fromLine,
+          maxLines,
+          lineNumbers: cli.opts.lineNumbers,
+        });
+        console.log(result.body);
+      }
       break;
     }
 
@@ -2494,12 +2506,46 @@ if (import.meta.main) {
       }
       const maxLinesMulti = cli.values.l ? parseInt(cli.values.l as string, 10) : undefined;
       const maxBytes = cli.values["max-bytes"] ? parseInt(cli.values["max-bytes"] as string, 10) : DEFAULT_MULTI_GET_MAX_BYTES;
-      multiGet(cli.args[0], maxLinesMulti, maxBytes, cli.opts.format);
+      {
+        const { ensureDaemon } = await import("./client.js");
+        const client = await ensureDaemon();
+        const result = await client.request("multi_get", {
+          pattern: cli.args[0],
+          maxLines: maxLinesMulti,
+          maxBytes,
+          lineNumbers: cli.opts.lineNumbers,
+        });
+        // Output multi-get result using existing formatter
+        for (const doc of result.docs) {
+          console.log(`\n${c.bold}${doc.displayPath}${c.reset}`);
+          console.log(doc.body);
+        }
+        if (result.errors.length > 0) {
+          console.error(`\n${c.yellow}Warnings:${c.reset}`);
+          for (const err of result.errors) {
+            console.error(`  ${err}`);
+          }
+        }
+      }
       break;
     }
 
     case "ls": {
-      listFiles(cli.args[0]);
+      const { ensureDaemon } = await import("./client.js");
+      const client = await ensureDaemon();
+      const result = await client.request("ls", {
+        prefix: cli.args[0],
+      });
+      if (result.type === "collections") {
+        console.log(`${c.bold}Collections:${c.reset}`);
+        for (const coll of result.collections) {
+          console.log(`  ${c.cyan}${coll.name}${c.reset} -> ${coll.path}`);
+        }
+      } else if (result.type === "files") {
+        for (const file of result.files) {
+          console.log(file.filepath);
+        }
+      }
       break;
     }
 
@@ -2552,7 +2598,7 @@ if (import.meta.main) {
     }
 
     case "status":
-      showStatus();
+      await showStatus();
       break;
 
     case "provider":
@@ -2592,7 +2638,17 @@ if (import.meta.main) {
         console.error("Usage: qmd search [options] <query>");
         process.exit(1);
       }
-      search(cli.query, cli.opts);
+      {
+        const { ensureDaemon } = await import("./client.js");
+        const client = await ensureDaemon();
+        const results = await client.request("search", {
+          query: cli.query,
+          limit: cli.opts.limit,
+          collection: cli.opts.collection,
+          minScore: cli.opts.minScore,
+        });
+        outputResults(results, cli.query, cli.opts);
+      }
       break;
 
     case "vsearch":
@@ -2605,7 +2661,17 @@ if (import.meta.main) {
       if (!cli.values["min-score"]) {
         cli.opts.minScore = 0.3;
       }
-      await vectorSearch(cli.query, cli.opts);
+      {
+        const { ensureDaemon } = await import("./client.js");
+        const client = await ensureDaemon();
+        const results = await client.request("vsearch", {
+          query: cli.query,
+          limit: cli.opts.limit,
+          collection: cli.opts.collection,
+          minScore: cli.opts.minScore,
+        });
+        outputResults(results, cli.query, cli.opts);
+      }
       break;
 
     case "query":
@@ -2614,75 +2680,72 @@ if (import.meta.main) {
         console.error("Usage: qmd query [options] <query>");
         process.exit(1);
       }
-      await querySearch(cli.query, cli.opts);
+      {
+        const { ensureDaemon } = await import("./client.js");
+        const client = await ensureDaemon();
+        const results = await client.request("query", {
+          query: cli.query,
+          limit: cli.opts.limit,
+          collection: cli.opts.collection,
+          minScore: cli.opts.minScore,
+        });
+        outputResults(results, cli.query, cli.opts);
+      }
       break;
 
-    case "mcp": {
-      const sub = cli.args[0]; // stop | status | undefined
+    case "daemon": {
+      const sub = cli.args[0]; // start | stop | status | undefined
 
-      // Cache dir for PID/log files — same dir as the index
-      const cacheDir = Bun.env.XDG_CACHE_HOME
-        ? resolve(Bun.env.XDG_CACHE_HOME, "qmd")
-        : resolve(homedir(), ".cache", "qmd");
-      const pidPath = resolve(cacheDir, "mcp.pid");
-
-      // Subcommands take priority over flags
       if (sub === "stop") {
-        if (!existsSync(pidPath)) {
-          console.log("Not running (no PID file).");
-          process.exit(0);
-        }
-        const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
-        try {
-          process.kill(pid, 0); // alive?
-          process.kill(pid, "SIGTERM");
-          unlinkSync(pidPath);
-          console.log(`Stopped QMD MCP server (PID ${pid}).`);
-        } catch {
-          unlinkSync(pidPath);
-          console.log("Cleaned up stale PID file (server was not running).");
+        const { stopDaemon } = await import("./daemon.js");
+        await stopDaemon();
+        process.exit(0);
+      }
+
+      if (sub === "status") {
+        const { getDaemonStatus } = await import("./client.js");
+        const status = await getDaemonStatus();
+
+        if (status) {
+          console.log(`Daemon: running (PID ${status.pid})`);
+          console.log(`Uptime: ${formatETA(status.uptime)}`);
+          console.log(`Requests: ${status.requestCount}`);
+          const models = [];
+          if (status.loadedModels.embed) models.push("embed");
+          if (status.loadedModels.generate) models.push("generate");
+          if (status.loadedModels.rerank) models.push("rerank");
+          if (models.length > 0) {
+            console.log(`Loaded models: ${models.join(", ")}`);
+          }
+        } else {
+          console.log("Daemon: not running");
         }
         process.exit(0);
       }
 
+      // Default or "start": start daemon in foreground
+      const { startDaemon } = await import("./daemon.js");
+      await startDaemon();
+      break;
+    }
+
+    case "mcp": {
+      // MCP server command - served by daemon
+      const sub = cli.args[0];
+
+      if (sub === "stop") {
+        const { stopDaemon } = await import("./daemon.js");
+        await stopDaemon();
+        process.exit(0);
+      }
+
+      // Start MCP server (stdio or HTTP)
+      const { startMcpServer, startMcpHttpServer } = await import("./mcp.js");
+
       if (cli.values.http) {
         const port = Number(cli.values.port) || 8181;
-
-        if (cli.values.daemon) {
-          // Guard: check if already running
-          if (existsSync(pidPath)) {
-            const existingPid = parseInt(readFileSync(pidPath, "utf-8").trim());
-            try {
-              process.kill(existingPid, 0); // alive?
-              console.error(`Already running (PID ${existingPid}). Run 'qmd mcp stop' first.`);
-              process.exit(1);
-            } catch {
-              // Stale PID file — continue
-            }
-          }
-
-          mkdirSync(cacheDir, { recursive: true });
-          const logPath = resolve(cacheDir, "mcp.log");
-          const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
-          const child = Bun.spawn([process.execPath, import.meta.path, "mcp", "--http", "--port", String(port)], {
-            stdout: logFd,
-            stderr: logFd,
-            stdin: "ignore",
-          });
-          child.unref();
-          closeSync(logFd); // parent's copy; child inherited the fd
-
-          writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://localhost:${port}/mcp (PID ${child.pid})`);
-          console.log(`Logs: ${logPath}`);
-          process.exit(0);
-        }
-
-        // Foreground HTTP mode — remove top-level cursor handlers so the
-        // async cleanup handlers in startMcpHttpServer actually run.
         process.removeAllListeners("SIGTERM");
         process.removeAllListeners("SIGINT");
-        const { startMcpHttpServer } = await import("./mcp.js");
         try {
           await startMcpHttpServer(port);
         } catch (e: any) {
@@ -2694,38 +2757,26 @@ if (import.meta.main) {
         }
       } else {
         // Default: stdio transport
-        const { startMcpServer } = await import("./mcp.js");
         await startMcpServer();
       }
       break;
     }
 
     case "cleanup": {
-      const db = getDb();
+      const { ensureDaemon } = await import("./client.js");
+      const client = await ensureDaemon();
+      const result = await client.request("cleanup", {});
 
-      // 1. Clear llm_cache
-      const cacheCount = deleteLLMCache(db);
-      console.log(`${c.green}✓${c.reset} Cleared ${cacheCount} cached API responses`);
-
-      // 2. Remove orphaned vectors
-      const orphanedVecs = cleanupOrphanedVectors(db);
-      if (orphanedVecs > 0) {
-        console.log(`${c.green}✓${c.reset} Removed ${orphanedVecs} orphaned embedding chunks`);
+      console.log(`${c.green}✓${c.reset} Cleared ${result.cacheCount} cached API responses`);
+      if (result.orphanedVecs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${result.orphanedVecs} orphaned embedding chunks`);
       } else {
         console.log(`${c.dim}No orphaned embeddings to remove${c.reset}`);
       }
-
-      // 3. Remove inactive documents
-      const inactiveDocs = deleteInactiveDocuments(db);
-      if (inactiveDocs > 0) {
-        console.log(`${c.green}✓${c.reset} Removed ${inactiveDocs} inactive document records`);
+      if (result.inactiveDocs > 0) {
+        console.log(`${c.green}✓${c.reset} Removed ${result.inactiveDocs} inactive document records`);
       }
-
-      // 4. Vacuum to reclaim space
-      vacuumDatabase(db);
       console.log(`${c.green}✓${c.reset} Database vacuumed`);
-
-      closeDb();
       break;
     }
 
